@@ -1,0 +1,11 @@
+{
+    "window": {
+        "name": "Mah Window",
+        "width": 600,
+        "height": 480
+    },
+    "shaders": {
+        "vertex": "assets/shaders/part-1.vert",
+        "fragment": "assets/shaders/part-1.frag"
+    }
+}
