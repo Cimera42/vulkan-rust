@@ -8,11 +8,7 @@ use glfw::{Action, Context, Key};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::mem::ManuallyDrop;
-use gfx_hal::{
-    device::Device,
-    window::{Extent2D, PresentationSurface, Surface},
-    Instance,
-};
+use gfx_hal::{Instance, device::Device, window::{Extent2D, PresentationSurface, Surface}};
 use shaderc::ShaderKind;
 
 mod shaders;
@@ -99,31 +95,20 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
 ) -> B::GraphicsPipeline {
     use gfx_hal::pass::Subpass;
     use gfx_hal::pso::{
-        BlendState, ColorBlendDesc, ColorMask, EntryPoint, Face, GraphicsPipelineDesc,
-        InputAssemblerDesc, Primitive, PrimitiveAssemblerDesc, Rasterizer, Specialization,
+        BlendState, ColorBlendDesc, ColorMask, Face, GraphicsPipelineDesc,
+        InputAssemblerDesc, Primitive, PrimitiveAssemblerDesc, Rasterizer,
     };
 
-    let vertex_shader_module = shaders::create_module::<B>(device, vertex_shader_filename, ShaderKind::Vertex);
-    let fragment_shader_module = shaders::create_module::<B>(device, fragment_shader_filename, ShaderKind::Fragment);
-
-    let (vs_entry, fs_entry) = (
-        EntryPoint {
-            entry: "main",
-            module: &vertex_shader_module,
-            specialization: Specialization::default(),
-        },
-        EntryPoint {
-            entry: "main",
-            module: &fragment_shader_module,
-            specialization: Specialization::default(),
-        },
-    );
+    let vertex_shader = shaders::create_module::<B>(device, vertex_shader_filename, ShaderKind::Vertex);
+    let vertex_entry = shaders::create_entry(&vertex_shader);
+    let fragment_shader = shaders::create_module::<B>(device, fragment_shader_filename, ShaderKind::Fragment);
+    let frag_entry = shaders::create_entry(&fragment_shader);
 
     let primitive_assembler = PrimitiveAssemblerDesc::Vertex {
         buffers: &[],
         attributes: &[],
         input_assembler: InputAssemblerDesc::new(Primitive::TriangleList),
-        vertex: vs_entry,
+        vertex: vertex_entry,
         tessellation: None,
         geometry: None,
     };
@@ -134,7 +119,7 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
             cull_face: Face::BACK,
             ..Rasterizer::FILL
         },
-        Some(fs_entry),
+        Some(frag_entry),
         pipeline_layout,
         Subpass {
             index: 0,
@@ -151,8 +136,8 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
             .create_graphics_pipeline(&pipeline_desc, None)
             .expect("Failed to create graphics pipeline");
 
-    device.destroy_shader_module(vertex_shader_module);
-    device.destroy_shader_module(fragment_shader_module);
+    device.destroy_shader_module(vertex_shader);
+    device.destroy_shader_module(fragment_shader);
 
     return pipeline;
 }
@@ -166,7 +151,7 @@ fn main() {
         glfw.with_primary_monitor(|_, m| {
             let monitor = m.expect("No monitor?");
             let (xscale, yscale) = monitor.get_content_scale();
-            println!("{0} {1}", xscale, yscale);
+
             let logical =  [config.window.width, config.window.height];
             let physical = [((logical[0] as f32) * xscale) as u32, ((logical[1] as f32) * yscale) as u32];
 
@@ -177,6 +162,7 @@ fn main() {
         .expect("Failed to create GLFW window.");
 
     window.set_key_polling(true);
+    window.set_size_polling(true);
     window.make_current();
 
     let mut surface_extent = Extent2D {
@@ -312,18 +298,16 @@ fn main() {
 
     let mut should_configure_swapchain = true;
 
-    window.make_current();
-
     while !window.should_close() {
         for (_, event) in glfw::flush_messages(&events) {
             match event {
                 glfw::WindowEvent::Key(Key::Escape, _, Action::Press, _) => {
                     window.set_should_close(true)
                 }
-                glfw::WindowEvent::Size(newWidth, newHeight) => {
+                glfw::WindowEvent::Size(new_width, new_height) => {
                     surface_extent = Extent2D {
-                        width: newWidth as u32,
-                        height: newHeight as u32,
+                        width: new_width as u32,
+                        height: new_height as u32,
                     };
                     should_configure_swapchain = true;
                 }
@@ -384,7 +368,7 @@ fn main() {
                 Ok((image, _)) => image,
                 Err(_) => {
                     should_configure_swapchain = true;
-                    return;
+                    continue;
                 }
             }
         };

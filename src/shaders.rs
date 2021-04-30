@@ -1,5 +1,5 @@
 use std::fs;
-use gfx_hal::device::Device;
+use gfx_hal::{device::Device, pso::{EntryPoint, Specialization}};
 use shaderc::ShaderKind;
 
 fn compile_shader(glsl: &str, shader_kind: ShaderKind) -> Vec<u32> {
@@ -12,13 +12,21 @@ fn compile_shader(glsl: &str, shader_kind: ShaderKind) -> Vec<u32> {
     return compiled_shader.as_binary().to_vec();
 }
 
+pub unsafe fn create_entry<B: gfx_hal::Backend>(shader_module: &B::ShaderModule) -> EntryPoint<B> {
+    return EntryPoint::<B> {
+        entry: "main",
+        module: &shader_module,
+        specialization: Specialization::default(),
+    };
+}
+
 pub unsafe fn create_module<B: gfx_hal::Backend>(device: &B::Device, filename: &str, kind: ShaderKind) -> B::ShaderModule {
     println!("{}", filename);
     let shader_ascii = fs::read_to_string(filename).expect("Could not load shader file");
 
-    let vertex_shader_module = device
+    let shader_module = device
         .create_shader_module(&compile_shader(&shader_ascii, kind))
-        .expect("Failed to create vertex shader module");
+        .expect("Failed to create shader module");
 
-    return vertex_shader_module;
+    return shader_module;
 }
