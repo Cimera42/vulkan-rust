@@ -6,9 +6,8 @@ extern crate glfw;
 
 use glfw::{Action, Context, Key};
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::mem::ManuallyDrop;
-use gfx_hal::{Instance, device::Device, window::{Extent2D, PresentationSurface, Surface}};
+use std::{fs, mem::ManuallyDrop};
+use gfx_hal::{Instance, adapter::Adapter, device::Device, format::Format, window::{Extent2D, PresentationSurface, Surface}};
 use shaderc::ShaderKind;
 
 mod shaders;
@@ -142,6 +141,73 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
     return pipeline;
 }
 
+
+fn make_render_pass<B: gfx_hal::Backend>(device: &B::Device, surface_color_format: Format) -> B::RenderPass {
+    use gfx_hal::image::Layout;
+    use gfx_hal::pass::{
+        Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, SubpassDesc,
+    };
+
+    let color_attachment = Attachment {
+        format: Some(surface_color_format),
+        samples: 1,
+        ops: AttachmentOps::new(AttachmentLoadOp::Clear, AttachmentStoreOp::Store),
+        stencil_ops: AttachmentOps::DONT_CARE,
+        layouts: Layout::Undefined..Layout::Present,
+    };
+
+    let subpass = SubpassDesc {
+        colors: &[(0, Layout::ColorAttachmentOptimal)],
+        depth_stencil: None,
+        inputs: &[],
+        resolves: &[],
+        preserves: &[],
+    };
+
+    return unsafe {
+        device
+            .create_render_pass(&[color_attachment], &[subpass], &[])
+            .expect("Out of memory")
+    }
+}
+
+
+unsafe fn wait_for_fence<B: gfx_hal::Backend>(device: &B::Device, fence: &B::Fence) {
+    // We refuse to wait more than a second, to avoid hanging.
+    let render_timeout_ns = 1_000_000_000;
+
+    device
+        .wait_for_fence(fence, render_timeout_ns)
+        .expect("Out of memory or device lost");
+
+    device
+        .reset_fence(fence)
+        .expect("Out of memory");
+
+}
+
+fn reconfigure_swapchain<B: gfx_hal::Backend>(device: &B::Device, surface: &mut B::Surface, adapter: &Adapter<B>, surface_color_format: Format, surface_extent: &mut Extent2D) {
+    use gfx_hal::window::SwapchainConfig;
+
+    let caps = surface.capabilities(&adapter.physical_device);
+
+    let mut swapchain_config =
+        SwapchainConfig::from_caps(&caps, surface_color_format, *surface_extent);
+
+    // This seems to fix some fullscreen slowdown on macOS.
+    if caps.image_count.contains(&3) {
+        swapchain_config.image_count = 3;
+    }
+
+    *surface_extent = swapchain_config.extent;
+
+    unsafe {
+        surface
+            .configure_swapchain(device, swapchain_config)
+            .expect("Failed to configure swapchain");
+    };
+}
+
 fn main() {
     let config = load_config("assets/config.json");
 
@@ -221,7 +287,7 @@ fn main() {
     };
 
     let surface_color_format = {
-        use gfx_hal::format::{ChannelType, Format};
+        use gfx_hal::format::{ChannelType};
 
         let supported_formats = surface
             .supported_formats(&adapter.physical_device)
@@ -235,34 +301,7 @@ fn main() {
             .unwrap_or(default_format)
     };
 
-    let render_pass = {
-        use gfx_hal::image::Layout;
-        use gfx_hal::pass::{
-            Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, SubpassDesc,
-        };
-
-        let color_attachment = Attachment {
-            format: Some(surface_color_format),
-            samples: 1,
-            ops: AttachmentOps::new(AttachmentLoadOp::Clear, AttachmentStoreOp::Store),
-            stencil_ops: AttachmentOps::DONT_CARE,
-            layouts: Layout::Undefined..Layout::Present,
-        };
-
-        let subpass = SubpassDesc {
-            colors: &[(0, Layout::ColorAttachmentOptimal)],
-            depth_stencil: None,
-            inputs: &[],
-            resolves: &[],
-            preserves: &[],
-        };
-
-        unsafe {
-            device
-                .create_render_pass(&[color_attachment], &[subpass], &[])
-                .expect("Out of memory")
-        }
-    };
+    let render_pass = make_render_pass::<backend::Backend>(&device, surface_color_format);
 
     let pipeline_layout = unsafe {
         device
@@ -315,47 +354,20 @@ fn main() {
             }
         }
 
-        let res: &mut Resources<_> = &mut resource_holder.0;
+        let res: &mut Resources<backend::Backend> = &mut resource_holder.0;
         let render_pass = &res.render_passes[0];
         let pipeline = &res.pipelines[0];
 
         unsafe {
             use gfx_hal::pool::CommandPool;
 
-            // We refuse to wait more than a second, to avoid hanging.
-            let render_timeout_ns = 1_000_000_000;
-
-            res.device
-                .wait_for_fence(&res.submission_complete_fence, render_timeout_ns)
-                .expect("Out of memory or device lost");
-
-            res.device
-                .reset_fence(&res.submission_complete_fence)
-                .expect("Out of memory");
+            wait_for_fence::<backend::Backend>(&res.device, &res.submission_complete_fence);
 
             res.command_pool.reset(false);
         }
 
         if should_configure_swapchain {
-            use gfx_hal::window::SwapchainConfig;
-
-            let caps = res.surface.capabilities(&adapter.physical_device);
-
-            let mut swapchain_config =
-                SwapchainConfig::from_caps(&caps, surface_color_format, surface_extent);
-
-            // This seems to fix some fullscreen slowdown on macOS.
-            if caps.image_count.contains(&3) {
-                swapchain_config.image_count = 3;
-            }
-
-            surface_extent = swapchain_config.extent;
-
-            unsafe {
-                res.surface
-                    .configure_swapchain(&res.device, swapchain_config)
-                    .expect("Failed to configure swapchain");
-            };
+            reconfigure_swapchain(&res.device, &mut res.surface, &adapter, surface_color_format, &mut surface_extent);
 
             should_configure_swapchain = false;
         }
