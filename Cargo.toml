@@ -12,6 +12,7 @@ serde_json = "1.0"
 gfx-hal = "=0.6.0"
 shaderc = "=0.6.2"
 cgmath = "0.18.0"
+gltf = "0.15.2"
 
 [target.'cfg(windows)'.dependencies.backend]
 package = "gfx-backend-dx12"
