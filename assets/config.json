@@ -5,7 +5,14 @@
         "height": 480
     },
     "shaders": {
-        "vertex": "assets/shaders/part-1.vert",
-        "fragment": "assets/shaders/part-1.frag"
+        "vertex": "assets/shaders/vert.vert",
+        "fragment": "assets/shaders/frag.frag"
+    },
+    "scene": {
+        "nodes": [
+            {
+                "path": "assets/models/pengwing.glb"
+            }
+        ]
     }
 }

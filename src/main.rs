@@ -4,10 +4,12 @@
 
 extern crate glfw;
 
+use cgmath::Matrix4;
 use glfw::{Action, Context, Key};
+use gltf::{Gltf, Semantic};
 use serde::{Deserialize, Serialize};
-use std::{fs, mem::ManuallyDrop};
-use gfx_hal::{Instance, adapter::Adapter, device::Device, format::Format, window::{Extent2D, PresentationSurface, Surface}};
+use std::{fs, mem::{ManuallyDrop, size_of}};
+use gfx_hal::{Instance, adapter::Adapter, buffer::{IndexBufferView, SubRange}, device::Device, format::Format, window::{Extent2D, PresentationSurface, Surface}};
 use shaderc::ShaderKind;
 
 mod shaders;
@@ -26,9 +28,21 @@ struct ShaderPaths {
 }
 
 #[derive(Serialize, Deserialize)]
+struct Node {
+    path: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Scene {
+    nodes: Vec<Node>,
+}
+
+
+#[derive(Serialize, Deserialize)]
 struct Config {
     window: Window,
     shaders: ShaderPaths,
+    scene: Scene,
 }
 
 struct Resources<B: gfx_hal::Backend> {
@@ -41,6 +55,12 @@ struct Resources<B: gfx_hal::Backend> {
     command_pool: B::CommandPool,
     submission_complete_fence: B::Fence,
     rendering_complete_semaphore: B::Semaphore,
+
+    vertex_buffer_memory: B::Memory,
+    vertex_buffer: B::Buffer,
+
+    index_buffer_memory: B::Memory,
+    index_buffer: B::Buffer,
 }
 
 struct ResourceHolder<B: gfx_hal::Backend>(ManuallyDrop<Resources<B>>);
@@ -59,7 +79,17 @@ impl<B: gfx_hal::Backend> Drop for ResourceHolder<B> {
                 pipelines,
                 submission_complete_fence,
                 rendering_complete_semaphore,
+                vertex_buffer_memory,
+                vertex_buffer,
+                index_buffer_memory,
+                index_buffer,
             } = ManuallyDrop::take(&mut self.0);
+
+            device.free_memory(vertex_buffer_memory);
+            device.destroy_buffer(vertex_buffer);
+
+            device.free_memory(index_buffer_memory);
+            device.destroy_buffer(index_buffer);
 
             device.destroy_semaphore(rendering_complete_semaphore);
             device.destroy_fence(submission_complete_fence);
@@ -78,6 +108,27 @@ impl<B: gfx_hal::Backend> Drop for ResourceHolder<B> {
         }
     }
 }
+
+#[repr(C)]
+struct Vertex {
+    position: [f32; 3],
+    normal: [f32; 3],
+}
+
+struct Mesh {
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct PushConstants {
+    // model_matrix: cgmath::Matrix4<f32>,
+    // view_matrix: cgmath::Matrix4<f32>,
+    // projection_matrix: cgmath::Matrix4<f32>,
+    mvp_matrix: cgmath::Matrix4<f32>,
+}
+
 
 fn load_config(filename: &str) -> Config {
     let config_string  = fs::read_to_string(filename).expect("Could not load config file");
@@ -103,19 +154,45 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
     let fragment_shader = shaders::create_module::<B>(device, fragment_shader_filename, ShaderKind::Fragment);
     let frag_entry = shaders::create_entry(&fragment_shader);
 
-    let primitive_assembler = PrimitiveAssemblerDesc::Vertex {
-        buffers: &[],
-        attributes: &[],
-        input_assembler: InputAssemblerDesc::new(Primitive::TriangleList),
-        vertex: vertex_entry,
-        tessellation: None,
-        geometry: None,
+    let primitive_assembler = {
+        use gfx_hal::pso::{AttributeDesc, Element, VertexBufferDesc, VertexInputRate};
+
+        PrimitiveAssemblerDesc::Vertex {
+            buffers: &[VertexBufferDesc {
+                binding: 0,
+                stride: std::mem::size_of::<Vertex>() as u32,
+                rate: VertexInputRate::Vertex,
+            }],
+
+            attributes: &[
+                AttributeDesc {
+                    location: 0,
+                    binding: 0,
+                    element: Element {
+                        format: Format::Rgb32Sfloat,
+                        offset: 0,
+                    },
+                },
+                AttributeDesc {
+                    location: 1,
+                    binding: 0,
+                    element: Element {
+                        format: Format::Rgb32Sfloat,
+                        offset: 12,
+                    },
+                },
+            ],
+            input_assembler: InputAssemblerDesc::new(Primitive::TriangleList),
+            vertex: vertex_entry,
+            tessellation: None,
+            geometry: None,
+        }
     };
 
     let mut pipeline_desc = GraphicsPipelineDesc::new(
         primitive_assembler,
         Rasterizer {
-            cull_face: Face::BACK,
+            cull_face: Face::NONE,
             ..Rasterizer::FILL
         },
         Some(frag_entry),
@@ -208,6 +285,82 @@ fn reconfigure_swapchain<B: gfx_hal::Backend>(device: &B::Device, surface: &mut 
     };
 }
 
+unsafe fn make_buffer<B: gfx_hal::Backend>(
+    device: &B::Device,
+    physical_device: &B::PhysicalDevice,
+    buffer_len: usize,
+    usage: gfx_hal::buffer::Usage,
+    properties: gfx_hal::memory::Properties,
+) -> (B::Memory, B::Buffer) {
+    use gfx_hal::{adapter::PhysicalDevice, MemoryTypeId};
+
+    let mut buffer = device
+        .create_buffer(buffer_len as u64, usage)
+        .expect("Failed to create buffer");
+
+    let req = device.get_buffer_requirements(&buffer);
+
+    let memory_types = physical_device.memory_properties().memory_types;
+
+    let memory_type = memory_types
+        .iter()
+        .enumerate()
+        .find(|(id, mem_type)| {
+            let type_supported = req.type_mask & (1_u32 << id) != 0;
+            type_supported && mem_type.properties.contains(properties)
+        })
+        .map(|(id, _ty)| MemoryTypeId(id))
+        .expect("No compatible memory type available");
+
+    let buffer_memory = device
+        .allocate_memory(memory_type, req.size)
+        .expect("Failed to allocate buffer memory");
+
+    device
+        .bind_buffer_memory(&buffer_memory, 0, &mut buffer)
+        .expect("Failed to bind buffer memory");
+
+    (buffer_memory, buffer)
+}
+
+fn read_mesh(filename: &str) -> Option<Mesh> {
+    let (gltf, buffers, images) = gltf::import(filename).expect("Could not load model");
+    for gltf_mesh in gltf.meshes() {
+        println!("Mesh #{}", gltf_mesh.index());
+        for primitive in gltf_mesh.primitives() {
+            println!("- Primitive #{}", primitive.index());
+            let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
+            let positions = reader.read_positions().unwrap().collect::<Vec<_>>();
+            let normals = reader.read_normals().unwrap().collect::<Vec<_>>();
+            let vertices = positions.into_iter().enumerate().map(|(index, position)| {
+                Vertex {
+                    position: position,
+                    normal: normals[index],
+                }
+            }).collect::<Vec<Vertex>>();
+
+            let indices = reader.read_indices().expect("Mesh does not have indices").into_u32().collect::<Vec<_>>();
+
+            return Option::Some(Mesh {
+                vertices,
+                indices,
+            })
+        }
+    }
+    return Option::None;
+}
+
+unsafe fn push_constant_bytes<T>(push_constants: &T) -> &[u32] {
+    let size_in_bytes = std::mem::size_of::<T>();
+    let size_in_u32s = size_in_bytes / std::mem::size_of::<u32>();
+    let start_ptr = push_constants as *const T as *const u32;
+    std::slice::from_raw_parts(start_ptr, size_in_u32s)
+}
+
+fn vec_size<T>(vector: &Vec<T>) -> usize {
+    return vector.len() * std::mem::size_of::<T>();
+}
+
 fn main() {
     let config = load_config("assets/config.json");
 
@@ -230,6 +383,8 @@ fn main() {
     window.set_key_polling(true);
     window.set_size_polling(true);
     window.make_current();
+
+    let mesh = read_mesh(&config.scene.nodes[0].path).expect("Mesh not initialized");
 
     let mut surface_extent = Extent2D {
         width: physical_window_size[0],
@@ -273,6 +428,69 @@ fn main() {
         (gpu.device, gpu.queue_groups.pop().unwrap())
     };
 
+    let vertex_buffer_len = vec_size(&mesh.vertices);
+
+    let (vertex_buffer_memory, vertex_buffer) = unsafe {
+        use gfx_hal::buffer::Usage;
+        use gfx_hal::memory::Properties;
+
+        make_buffer::<backend::Backend>(
+            &device,
+            &adapter.physical_device,
+            vertex_buffer_len,
+            Usage::VERTEX,
+            Properties::CPU_VISIBLE,
+        )
+    };
+
+    unsafe {
+        use gfx_hal::memory::Segment;
+
+        let mapped_memory = device
+            .map_memory(&vertex_buffer_memory, Segment::ALL)
+            .expect("Failed to map memory");
+
+        std::ptr::copy_nonoverlapping(mesh.vertices.as_ptr() as *const u8, mapped_memory, vertex_buffer_len);
+
+        device
+            .flush_mapped_memory_ranges(vec![(&vertex_buffer_memory, Segment::ALL)])
+            .expect("Out of memory");
+
+        device.unmap_memory(&vertex_buffer_memory);
+    }
+
+    let index_buffer_len = vec_size(&mesh.indices);
+
+    let (index_buffer_memory, index_buffer) = unsafe {
+        use gfx_hal::buffer::Usage;
+        use gfx_hal::memory::Properties;
+
+        make_buffer::<backend::Backend>(
+            &device,
+            &adapter.physical_device,
+            index_buffer_len,
+            Usage::INDEX,
+            Properties::CPU_VISIBLE,
+        )
+    };
+
+    unsafe {
+        use gfx_hal::memory::Segment;
+
+        let mapped_memory = device
+            .map_memory(&index_buffer_memory, Segment::ALL)
+            .expect("Failed to map memory");
+
+        std::ptr::copy_nonoverlapping(mesh.indices.as_ptr() as *const u8, mapped_memory, index_buffer_len);
+
+        device
+            .flush_mapped_memory_ranges(vec![(&index_buffer_memory, Segment::ALL)])
+            .expect("Out of memory");
+
+        device.unmap_memory(&index_buffer_memory);
+    }
+
+
     let (command_pool, mut command_buffer) = unsafe {
         use gfx_hal::command::Level;
         use gfx_hal::pool::{CommandPool, CommandPoolCreateFlags};
@@ -304,8 +522,12 @@ fn main() {
     let render_pass = make_render_pass::<backend::Backend>(&device, surface_color_format);
 
     let pipeline_layout = unsafe {
+        use gfx_hal::pso::ShaderStageFlags;
+
+        let push_constant_bytes = std::mem::size_of::<PushConstants>() as u32;
+
         device
-            .create_pipeline_layout(&[], &[])
+            .create_pipeline_layout(&[], &[(ShaderStageFlags::VERTEX, 0..push_constant_bytes)])
             .expect("Out of memory")
     };
 
@@ -318,6 +540,7 @@ fn main() {
             &config.shaders.fragment,
         )
     };
+
 
     let submission_complete_fence = device.create_fence(true).expect("Out of memory");
     let rendering_complete_semaphore = device.create_semaphore().expect("Out of memory");
@@ -333,9 +556,15 @@ fn main() {
             pipelines: vec![pipeline],
             submission_complete_fence,
             rendering_complete_semaphore,
+            vertex_buffer_memory,
+            vertex_buffer,
+            index_buffer_memory,
+            index_buffer,
         }));
 
     let mut should_configure_swapchain = true;
+
+    let start_time = std::time::Instant::now();
 
     while !window.should_close() {
         for (_, event) in glfw::flush_messages(&events) {
@@ -357,6 +586,23 @@ fn main() {
         let res: &mut Resources<backend::Backend> = &mut resource_holder.0;
         let render_pass = &res.render_passes[0];
         let pipeline = &res.pipelines[0];
+        let pipeline_layout = &res.pipeline_layouts[0];
+
+        let angle = start_time.elapsed().as_secs_f32();
+
+        let model_matrix = cgmath::Matrix4::from_translation(cgmath::vec3::<f32>(0.0, 0.0, -1.0 * angle));
+        let view_matrix: Matrix4<f32> =cgmath::Matrix4::look_at_lh(
+            cgmath::point3(0.0, 0.0, -1.0),
+            cgmath::point3(0.0, 0.0, 0.0),
+            cgmath::vec3(0.0, 1.0, 0.0)
+        );
+        let projection_matrix = cgmath::perspective(cgmath::Deg(100.0), config.window.width as f32 / config.window.height as f32, 0.1, 100.0);
+        let push_constants = PushConstants {
+            // model_matrix,
+            // view_matrix,
+            // projection_matrix,
+            mvp_matrix: projection_matrix * view_matrix * model_matrix
+        };
 
         unsafe {
             use gfx_hal::pool::CommandPool;
@@ -427,6 +673,23 @@ fn main() {
             command_buffer.set_viewports(0, &[viewport.clone()]);
             command_buffer.set_scissors(0, &[viewport.rect]);
 
+            command_buffer.bind_vertex_buffers(
+                0,
+                vec![(&res.vertex_buffer, gfx_hal::buffer::SubRange::WHOLE)],
+            );
+
+            let indices_count = mesh.indices.len() as u32;
+            command_buffer.bind_index_buffer(
+                IndexBufferView {
+                    buffer: &res.index_buffer,
+                    index_type: gfx_hal::IndexType::U32,
+                    range: SubRange {
+                        offset: 0,
+                        size: Option::None,
+                    },
+                }
+            );
+
             command_buffer.begin_render_pass(
                 render_pass,
                 &framebuffer,
@@ -441,7 +704,19 @@ fn main() {
 
             command_buffer.bind_graphics_pipeline(pipeline);
 
-            command_buffer.draw(0..3, 0..1);
+            use gfx_hal::pso::ShaderStageFlags;
+
+            command_buffer.push_graphics_constants(
+                pipeline_layout,
+                ShaderStageFlags::VERTEX,
+                0,
+                push_constant_bytes(&[push_constants]),
+            );
+
+            let vertices_count = mesh.vertices.len() as u32;
+            command_buffer.draw_indexed(0..indices_count, 0, 0..1);
+            // command_buffer.draw(0..vertices_count, 0..1);
+
             command_buffer.end_render_pass();
             command_buffer.finish();
         }
