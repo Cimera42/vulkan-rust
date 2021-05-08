@@ -6,9 +6,8 @@ extern crate glfw;
 
 use cgmath::Matrix4;
 use glfw::{Action, Context, Key};
-use gltf::{Gltf, Semantic};
 use serde::{Deserialize, Serialize};
-use std::{fs, mem::{ManuallyDrop, size_of}};
+use std::{fs, mem::{ManuallyDrop}};
 use gfx_hal::{Instance, adapter::Adapter, buffer::{IndexBufferView, SubRange}, device::Device, format::Format, window::{Extent2D, PresentationSurface, Surface}};
 use shaderc::ShaderKind;
 
@@ -324,7 +323,7 @@ unsafe fn make_buffer<B: gfx_hal::Backend>(
 }
 
 fn read_mesh(filename: &str) -> Option<Mesh> {
-    let (gltf, buffers, images) = gltf::import(filename).expect("Could not load model");
+    let (gltf, buffers, _images) = gltf::import(filename).expect("Could not load model");
     for gltf_mesh in gltf.meshes() {
         println!("Mesh #{}", gltf_mesh.index());
         for primitive in gltf_mesh.primitives() {
@@ -713,7 +712,6 @@ fn main() {
                 push_constant_bytes(&[push_constants]),
             );
 
-            let vertices_count = mesh.vertices.len() as u32;
             command_buffer.draw_indexed(0..indices_count, 0, 0..1);
             // command_buffer.draw(0..vertices_count, 0..1);
 
