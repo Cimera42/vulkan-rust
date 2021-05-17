@@ -4,11 +4,11 @@
 
 extern crate glfw;
 
-use cgmath::Matrix4;
+use cgmath::{EuclideanSpace, InnerSpace, Matrix4, Point3, Quaternion, Rotation3};
 use glfw::{Action, Context, Key};
 use serde::{Deserialize, Serialize};
 use std::{fs, mem::{ManuallyDrop}};
-use gfx_hal::{Instance, adapter::Adapter, buffer::{IndexBufferView, SubRange}, device::Device, format::Format, window::{Extent2D, PresentationSurface, Surface}};
+use gfx_hal::{Backend, Instance, adapter::Adapter, buffer::{IndexBufferView, SubRange}, device::Device, format::{Aspects, D32Sfloat, Format, Swizzle}, image::{Kind, SubresourceRange, Usage, ViewCapabilities}, pass::SubpassDependency, pso::{DepthStencilDesc, DepthTest}, window::{Extent2D, PresentationSurface, Surface}};
 use shaderc::ShaderKind;
 
 mod shaders;
@@ -122,10 +122,10 @@ struct Mesh {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct PushConstants {
-    // model_matrix: cgmath::Matrix4<f32>,
-    // view_matrix: cgmath::Matrix4<f32>,
-    // projection_matrix: cgmath::Matrix4<f32>,
-    mvp_matrix: cgmath::Matrix4<f32>,
+    // model_matrix: Matrix4<f32>,
+    // view_matrix: Matrix4<f32>,
+    // projection_matrix: Matrix4<f32>,
+    mvp_matrix: Matrix4<f32>,
 }
 
 
@@ -191,7 +191,8 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
     let mut pipeline_desc = GraphicsPipelineDesc::new(
         primitive_assembler,
         Rasterizer {
-            cull_face: Face::NONE,
+            cull_face: Face::BACK,
+            front_face: gfx_hal::pso::FrontFace::Clockwise,
             ..Rasterizer::FILL
         },
         Some(frag_entry),
@@ -381,6 +382,8 @@ fn main() {
 
     window.set_key_polling(true);
     window.set_size_polling(true);
+    window.set_cursor_mode(glfw::CursorMode::Disabled);
+    window.set_cursor_pos(0.0, 0.0);
     window.make_current();
 
     let mesh = read_mesh(&config.scene.nodes[0].path).expect("Mesh not initialized");
@@ -563,7 +566,11 @@ fn main() {
 
     let mut should_configure_swapchain = true;
 
-    let start_time = std::time::Instant::now();
+    // let start_time = std::time::Instant::now();
+    // let angle = start_time.elapsed().as_secs_f32();
+
+    let mut camera_rotation = Quaternion::<f32>::new(1.0,0.0,0.0,0.0).normalize();
+    let mut camera_position = cgmath::point3(0.0, 0.0, 0.0);
 
     while !window.should_close() {
         for (_, event) in glfw::flush_messages(&events) {
@@ -582,18 +589,42 @@ fn main() {
             }
         }
 
+        let (x, y) = window.get_cursor_pos();
+        let yaw: Quaternion<f32> = Rotation3::from_axis_angle(cgmath::vec3(0.0, -1.0, 0.0), cgmath::Deg(x as f32 / 2.0));
+        let left = camera_rotation * cgmath::vec3(-1.0, 0.0, 0.0);
+        let pitch: Quaternion<f32> = Rotation3::from_axis_angle(left, cgmath::Deg(y as f32 / 2.0));
+        camera_rotation = yaw * pitch * camera_rotation;
+        window.set_cursor_pos(0.0, 0.0);
+
+        let new_right = camera_rotation * cgmath::vec3(-1.0, 0.0, 0.0) * 0.25;
+        let new_forward = camera_rotation * cgmath::vec3(0.0, 0.0, 1.0) * 0.25;
+
+        if window.get_key(Key::D) == Action::Press {
+            camera_position += new_right;
+        }
+
+        if window.get_key(Key::A) == Action::Press {
+            camera_position -= new_right;
+        }
+
+        if window.get_key(Key::W) == Action::Press {
+            camera_position += new_forward;
+        }
+
+        if window.get_key(Key::S) == Action::Press {
+            camera_position -= new_forward;
+        }
+
         let res: &mut Resources<backend::Backend> = &mut resource_holder.0;
         let render_pass = &res.render_passes[0];
         let pipeline = &res.pipelines[0];
         let pipeline_layout = &res.pipeline_layouts[0];
 
-        let angle = start_time.elapsed().as_secs_f32();
-
-        let model_matrix = cgmath::Matrix4::from_translation(cgmath::vec3::<f32>(0.0, 0.0, -1.0 * angle));
-        let view_matrix: Matrix4<f32> =cgmath::Matrix4::look_at_lh(
-            cgmath::point3(0.0, 0.0, -1.0),
-            cgmath::point3(0.0, 0.0, 0.0),
-            cgmath::vec3(0.0, 1.0, 0.0)
+        let model_matrix = Matrix4::from_translation(cgmath::vec3::<f32>(0.0, 0.0, 5.0));
+        let view_matrix: Matrix4<f32> =Matrix4::look_at_lh(
+            camera_position + (camera_rotation * cgmath::vec3(0.0, 0.0, 1.0)),
+            camera_position,
+            camera_rotation * cgmath::vec3(0.0, 1.0, 0.0),
         );
         let projection_matrix = cgmath::perspective(cgmath::Deg(100.0), config.window.width as f32 / config.window.height as f32, 0.1, 100.0);
         let push_constants = PushConstants {
