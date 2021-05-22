@@ -4,6 +4,9 @@ version = "0.1.0"
 authors = ["Tim Porritt <tim.m.porritt@gmail.com>"]
 edition = "2018"
 
+[profile.dev]
+opt-level = 0
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -20,3 +23,6 @@ version = "=0.6.3"
 
 [dependencies.glfw]
 git = "https://github.com/bjz/glfw-rs.git"
+
+# [replace]
+# "gfx-backend-dx12:0.6.3" = {path = "C:/Users/Tim/.cargo/registry/src/github.com-1ecc6299db9ec823/gfx-backend-dx12-0.6.3"}

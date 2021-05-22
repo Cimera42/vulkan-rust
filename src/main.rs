@@ -8,10 +8,11 @@ use cgmath::{EuclideanSpace, InnerSpace, Matrix4, Point3, Quaternion, Rotation3}
 use glfw::{Action, Context, Key};
 use serde::{Deserialize, Serialize};
 use std::{fs, mem::{ManuallyDrop}};
-use gfx_hal::{Backend, Instance, adapter::Adapter, buffer::{IndexBufferView, SubRange}, device::Device, format::{Aspects, D32Sfloat, Format, Swizzle}, image::{Kind, SubresourceRange, Usage, ViewCapabilities}, pass::SubpassDependency, pso::{DepthStencilDesc, DepthTest}, window::{Extent2D, PresentationSurface, Surface}};
+use gfx_hal::{Backend, Instance, adapter::Adapter, buffer::{IndexBufferView, SubRange}, command::ClearDepthStencil, device::Device, format::{Aspects, D32Sfloat, Format, Swizzle}, image::{Access, Kind, Layout, SubresourceRange, Usage, ViewCapabilities}, memory::Dependencies, pass::{SubpassDependency, SubpassId}, pso::{DepthStencilDesc, DepthTest, PipelineStage}, window::{Extent2D, PresentationSurface, Surface}};
 use shaderc::ShaderKind;
 
 mod shaders;
+mod texture;
 
 #[derive(Serialize, Deserialize)]
 struct Window {
@@ -208,6 +209,14 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
         blend: Some(BlendState::ALPHA),
     });
 
+    pipeline_desc.depth_stencil = DepthStencilDesc {
+        depth: Some(DepthTest {
+            fun: gfx_hal::pso::Comparison::Less,
+            write: true,
+        }),
+        ..Default::default()
+    };
+
     let pipeline = device
             .create_graphics_pipeline(&pipeline_desc, None)
             .expect("Failed to create graphics pipeline");
@@ -219,7 +228,7 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
 }
 
 
-fn make_render_pass<B: gfx_hal::Backend>(device: &B::Device, surface_color_format: Format) -> B::RenderPass {
+fn make_render_pass<B: gfx_hal::Backend>(device: &B::Device, surface_color_format: Format, surface_depth_format: Format) -> B::RenderPass {
     use gfx_hal::image::Layout;
     use gfx_hal::pass::{
         Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, SubpassDesc,
@@ -233,17 +242,34 @@ fn make_render_pass<B: gfx_hal::Backend>(device: &B::Device, surface_color_forma
         layouts: Layout::Undefined..Layout::Present,
     };
 
+    let depth_attachment = Attachment {
+        format: Some(Format::D32SfloatS8Uint/* surface_depth_format */),
+        samples: 1,
+        ops: AttachmentOps::new(AttachmentLoadOp::Clear, AttachmentStoreOp::DontCare),
+        stencil_ops: AttachmentOps::DONT_CARE,
+        layouts: Layout::Undefined..Layout::DepthStencilAttachmentOptimal,
+    };
+
     let subpass = SubpassDesc {
         colors: &[(0, Layout::ColorAttachmentOptimal)],
-        depth_stencil: None,
+        depth_stencil: Some(&(1, Layout::DepthStencilAttachmentOptimal)),
         inputs: &[],
         resolves: &[],
         preserves: &[],
     };
 
+    // let dependency = SubpassDependency {
+    //     passes: None..Some(0),
+    //     stages: PipelineStage::COLOR_ATTACHMENT_OUTPUT..
+    //         PipelineStage::COLOR_ATTACHMENT_OUTPUT,
+    //     accesses: Access::empty()..
+    //         (Access::COLOR_ATTACHMENT_READ | Access::COLOR_ATTACHMENT_WRITE),
+    //     flags: Dependencies::empty(),
+    // };
+
     return unsafe {
         device
-            .create_render_pass(&[color_attachment], &[subpass], &[])
+            .create_render_pass(&[color_attachment, depth_attachment], &[subpass], &[/* dependency */])
             .expect("Out of memory")
     }
 }
@@ -506,22 +532,31 @@ fn main() {
         (command_pool, command_buffer)
     };
 
-    let surface_color_format = {
+    let (surface_color_format, surface_depth_format) = {
         use gfx_hal::format::{ChannelType};
 
         let supported_formats = surface
             .supported_formats(&adapter.physical_device)
             .unwrap_or(vec![]);
 
-        let default_format = *supported_formats.get(0).unwrap_or(&Format::Rgba8Srgb);
+        let default_format = supported_formats.get(0).unwrap_or(&Format::Rgba8Srgb);
 
-        supported_formats
+        let color_format = (&supported_formats)
             .into_iter()
             .find(|format| format.base_format().1 == ChannelType::Srgb)
-            .unwrap_or(default_format)
+            .unwrap_or(default_format);
+
+        let default_depth_format = supported_formats.get(0).unwrap_or(&Format::D32Sfloat);
+
+        let depth_format = (&supported_formats)
+            .into_iter()
+            .find(|format| format.base_format().1 == ChannelType::Sfloat)
+            .unwrap_or(default_depth_format);
+
+        (*color_format, *depth_format)
     };
 
-    let render_pass = make_render_pass::<backend::Backend>(&device, surface_color_format);
+    let render_pass = make_render_pass::<backend::Backend>(&device, surface_color_format, surface_depth_format);
 
     let pipeline_layout = unsafe {
         use gfx_hal::pso::ShaderStageFlags;
@@ -661,6 +696,41 @@ fn main() {
             }
         };
 
+        let (depth_image, depth_image_memory) = unsafe {
+            texture::create_image::<backend::Backend>(
+                &res.device,
+                &adapter.physical_device,
+                texture::ImageInfo {
+                    kind: Kind::D2(surface_extent.width, surface_extent.height, 1, 1),
+                    format: Format::D32SfloatS8Uint,//surface_depth_format,
+                    tiling: gfx_hal::image::Tiling::Optimal,
+                    usage: Usage::DEPTH_STENCIL_ATTACHMENT,
+                    view_caps: ViewCapabilities::empty()
+                }
+            )
+        };
+
+        let depth_image_view = unsafe {
+            texture::create_image_view::<backend::Backend>(
+                &res.device,
+                &depth_image,
+                texture::ImageViewInfo {
+                    kind: gfx_hal::image::ViewKind::D2,
+                    format: Format::D32SfloatS8Uint,//surface_depth_format,
+                    aspects: Aspects::DEPTH,
+                }
+            )
+        };
+
+        unsafe {
+            texture::transition_image_layout::<backend::Backend>(
+                &mut res.command_pool,
+                Layout::Undefined..Layout::DepthStencilAttachmentOptimal,
+                &depth_image,
+                &mut queue_group.queues[0],
+            );
+        }
+
         let framebuffer = unsafe {
             use std::borrow::Borrow;
 
@@ -669,7 +739,7 @@ fn main() {
             res.device
                 .create_framebuffer(
                     render_pass,
-                    vec![surface_image.borrow()],
+                    vec![surface_image.borrow(), depth_image_view.borrow()],
                     Extent {
                         width: surface_extent.width,
                         height: surface_extent.height,
@@ -728,6 +798,11 @@ fn main() {
                     color: ClearColor {
                         float32: [0.0, 0.0, 0.0, 1.0],
                     },
+                }, ClearValue {
+                    depth_stencil: ClearDepthStencil {
+                        depth: 1.0,
+                        stencil: 0,
+                    }
                 }],
                 SubpassContents::Inline,
             );
